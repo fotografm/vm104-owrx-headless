@@ -32,14 +32,19 @@ A watchdog runs every 30 minutes via systemd timer, validates all settings, and 
 
 ### WSJTX 2.x compatibility patches (CRITICAL)
 
-OpenWebRX+ 1.2.x was designed for jt9 1.x which wrote decoded results to stdout. WSJTX 2.x jt9 writes only `<DecodeFinished>` to stdout — decoded results go to `decoded.txt` file. Two files must be patched after any `apt upgrade` of wsjtx:
+OpenWebRX+ 1.2.x was designed for jt9 1.x which wrote decoded results to stdout. WSJTX 2.x jt9 writes only `<DecodeFinished>` to stdout — decoded results go to `decoded.txt` file. Two files must be patched after any `apt upgrade` of openwebrx:
 
-**`/usr/lib/python3/dist-packages/owrx/audio/queue.py`** — `QueueJob.run()` must read from `decoded.txt` instead of stdout. Backup is at `queue.py.bak`.
+**`/usr/lib/python3/dist-packages/owrx/audio/queue.py`** — `QueueJob.run()` has two fixes:
+1. Read decodes from `decoded.txt` instead of stdout.
+2. Truncate `decoded.txt` to 0 bytes **before** each jt9 run. jt9 2.x overwrites the file (not appends), so without this the `pre_size` mechanism seeks to the old file size and reads nothing — causing `pskreporter_spots_total` to stay permanently at 0 even when decodes are happening.
 
-**`/usr/lib/python3/dist-packages/owrx/wsjt.py`** — `Jt9Decoder.parse()` must handle the new format (extra `depth` field, decimal freq). Backup is at `wsjt.py.bak`.
+**`/usr/lib/python3/dist-packages/owrx/wsjt.py`** — `Jt9Decoder.parse()` must handle the new format (extra `depth` field, decimal freq, `MODE` suffix).
 
-To re-apply the patches after a wsjtx upgrade, run the patch script:
-`sudo python3 /tmp/patch_wsjt.py` (if still present) or re-apply from git.
+The patch script lives permanently at `/usr/local/bin/patch_owrx.py`. To re-apply after an upgrade:
+
+`sudo python3 /usr/local/bin/patch_owrx.py && sudo systemctl restart openwebrx`
+
+The script is idempotent — safe to run multiple times. Source of truth is this repo (`patch_owrx.py`).
 
 ---
 
@@ -248,7 +253,7 @@ After any web admin save, re-run the Python snippet above to restore 6m to the f
 
 **FT8 decoder not running** — check `services` and `services_enabled` are both `true`. Restart openwebrx.
 
-**No spots on PSKReporter** — Check `receiver_gps` is set: `sudo python3 -c "import json; d=json.load(open('/var/lib/openwebrx/settings.json')); print(d.get('receiver_gps'))"`. PSKReporter batches every 5 minutes. 6m FT8 is a daytime band — no propagation = nothing to report. Verify patches are in place (see WSJTX 2.x section). Check metrics: `curl -s http://localhost:8073/metrics | grep psk` — `pskreporter_spots_total` should be climbing.
+**No spots on PSKReporter** — Check `receiver_gps` is set: `sudo python3 -c "import json; d=json.load(open('/var/lib/openwebrx/settings.json')); print(d.get('receiver_gps'))"`. PSKReporter batches every 5 minutes. 6m FT8 is a daytime band — no propagation = nothing to report. Verify patches are in place: `sudo python3 /usr/local/bin/patch_owrx.py` (will say "already patched" if OK). Check metrics: `curl -s http://localhost:8073/metrics | grep psk` — `pskreporter_spots_total` should be climbing. If `pskreporter_spots_total` stays at 0 after restarting despite `wsjt_decodes_6m_FT8_total` climbing, the queue.py truncation patch is missing — re-run the patch script.
 
 **Verify UDP packets are being sent** — `sudo tcpdump -i any -n 'udp and port 4739'` for 6 minutes. Should see one packet per 5-minute cycle.
 
