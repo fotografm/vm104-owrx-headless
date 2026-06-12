@@ -38,7 +38,10 @@ OpenWebRX+ 1.2.x was designed for jt9 1.x which wrote decoded results to stdout.
 1. Read decodes from `decoded.txt` instead of stdout.
 2. Truncate `decoded.txt` to 0 bytes **before** each jt9 run. jt9 2.x overwrites the file (not appends), so without this the `pre_size` mechanism seeks to the old file size and reads nothing — causing `pskreporter_spots_total` to stay permanently at 0 even when decodes are happening.
 
-**`/usr/lib/python3/dist-packages/owrx/wsjt.py`** — `Jt9Decoder.parse()` must handle the new format (extra `depth` field, decimal freq, `MODE` suffix).
+**`/usr/lib/python3/dist-packages/owrx/wsjt.py`** — three fixes:
+1. `WsjtParser`: skip lines containing null bytes. Under heavy sporadic-E propagation jt9 decodes many simultaneous signals and writes Fortran null-padded lines into `decoded.txt`. These crash the parser, fill the log with chained `ValueError` tracebacks, and freeze the FT8 mini-spectrum display in the browser.
+2. `Jt9Decoder.parse()`: handle the new decoded.txt format (extra `depth` field, decimal freq, `MODE` suffix).
+3. `Jt9Decoder.parse()`: guard the new-format `except` block in its own `try/except` so its own `ValueError` re-raises cleanly instead of chaining with the original exception and producing confusing log output.
 
 The patch script lives permanently at `/usr/local/bin/patch_owrx.py`. To re-apply after an upgrade:
 
@@ -260,3 +263,7 @@ After any web admin save, re-run the Python snippet above to restore 6m to the f
 **Check watchdog log** — `sudo tail -20 /var/log/owrx-watchdog.log`
 
 **Check decode metrics** — `curl -s http://localhost:8073/metrics | grep -E 'psk|wsjt|decod'` — shows spots queued, decodes per band/mode, queue depth.
+
+**FT8 mini-spectrum display frozen / black in browser after browser refresh** — the WebSocket connection dropped when openwebrx restarted. Refresh the page again; the main waterfall should recover immediately. If the FT8 decode sub-display remains black, it usually means all decode lines are failing to parse (see below).
+
+**FT8 display frozen during high-propagation (sporadic-E) conditions** — jt9 writes null-padded lines into `decoded.txt` when decoding many simultaneous signals. This crashes the parser and stops decode output reaching the browser. Re-run the patch script to check the null-byte skip is in place: `sudo python3 /usr/local/bin/patch_owrx.py`. Check `sudo journalctl -u openwebrx --since '5 minutes ago' | grep 'Exception while parsing'` — if you see repeated parse errors, the wsjt.py patches need re-applying.
