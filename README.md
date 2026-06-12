@@ -35,13 +35,14 @@ A watchdog runs every 30 minutes via systemd timer, validates all settings, and 
 OpenWebRX+ 1.2.x was designed for jt9 1.x which wrote decoded results to stdout. WSJTX 2.x jt9 writes only `<DecodeFinished>` to stdout — decoded results go to `decoded.txt` file. Two files must be patched after any `apt upgrade` of openwebrx:
 
 **`/usr/lib/python3/dist-packages/owrx/audio/queue.py`** — `QueueJob.run()` has two fixes:
-1. Read decodes from `decoded.txt` instead of stdout.
-2. Truncate `decoded.txt` to 0 bytes **before** each jt9 run. jt9 2.x overwrites the file (not appends), so without this the `pre_size` mechanism seeks to the old file size and reads nothing — causing `pskreporter_spots_total` to stay permanently at 0 even when decodes are happening.
+1. For jt9-based decoders (FT8, FT4, JT65): read decodes from `decoded.txt` instead of stdout; truncate `decoded.txt` to 0 bytes **before** each run. jt9 2.x overwrites the file (not appends), so without truncation the seek-from-old-size mechanism reads nothing — causing `pskreporter_spots_total` to stay permanently at 0. Truncation also avoids a race condition with concurrent queue workers: without it, a long wsprd job (60 s) would read `decoded.txt` content written by a concurrent FT8 job and pass FT8 lines to `WsprDecoder`.
+2. For `wsprd` (WSPR): read from stdout, not `decoded.txt`. `wsprd` writes its results to stdout and `wspr_spots.txt` — not to `decoded.txt`. The previous patch silently discarded all WSPR decodes.
 
-**`/usr/lib/python3/dist-packages/owrx/wsjt.py`** — three fixes:
+**`/usr/lib/python3/dist-packages/owrx/wsjt.py`** — four fixes:
 1. `WsjtParser`: skip lines containing null bytes. Under heavy sporadic-E propagation jt9 decodes many simultaneous signals and writes Fortran null-padded lines into `decoded.txt`. These crash the parser, fill the log with chained `ValueError` tracebacks, and freeze the FT8 mini-spectrum display in the browser.
 2. `Jt9Decoder.parse()`: handle the new decoded.txt format (extra `depth` field, decimal freq, `MODE` suffix).
 3. `Jt9Decoder.parse()`: guard the new-format `except` block in its own `try/except` so its own `ValueError` re-raises cleanly instead of chaining with the original exception and producing confusing log output.
+4. `WsprDecoder.parse()`: replace fixed-byte-slice parsing with `split()`-based parsing that handles both old wsprd format (7 fields after timestamp strip) and new wsprd 2.x format (8 fields with `ntype` prepended). Old format was fragile against format changes and against FT8 content accidentally landing in the parser.
 
 The patch script lives permanently at `/usr/local/bin/patch_owrx.py`. To re-apply after an upgrade:
 
@@ -267,3 +268,5 @@ After any web admin save, re-run the Python snippet above to restore 6m to the f
 **FT8 mini-spectrum display frozen / black in browser after browser refresh** — the WebSocket connection dropped when openwebrx restarted. Refresh the page again; the main waterfall should recover immediately. If the FT8 decode sub-display remains black, it usually means all decode lines are failing to parse (see below).
 
 **FT8 display frozen during high-propagation (sporadic-E) conditions** — jt9 writes null-padded lines into `decoded.txt` when decoding many simultaneous signals. This crashes the parser and stops decode output reaching the browser. Re-run the patch script to check the null-byte skip is in place: `sudo python3 /usr/local/bin/patch_owrx.py`. Check `sudo journalctl -u openwebrx --since '5 minutes ago' | grep 'Exception while parsing'` — if you see repeated parse errors, the wsjt.py patches need re-applying.
+
+**WSPR parse errors in journal every 2 minutes** — errors like `ValueError: could not convert string to float: '5  -'` in `WsprDecoder.parse()` mean one of two things: (a) `wsprd` stdout is not being read (the old queue.py patch discarded it), or (b) a concurrent FT8 job wrote FT8 lines to `decoded.txt` and the WSPR job read them instead. Both are fixed by the current `queue.py` patch. Re-apply: `sudo python3 /usr/local/bin/patch_owrx.py && sudo systemctl restart openwebrx`.

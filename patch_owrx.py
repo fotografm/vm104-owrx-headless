@@ -4,7 +4,7 @@ Re-apply WSJTX 2.x compatibility patches to OpenWebRX+ after apt upgrade.
 Safe to run multiple times (idempotent).
 
 Patches:
-  wsjt.py   — Three fixes:
+  wsjt.py   — Four fixes:
               1. WsjtParser: skip lines containing null bytes (jt9 Fortran
                  null-padding when many signals decoded at once; causes parse
                  errors and frozen FT8 display under sporadic-E conditions)
@@ -12,9 +12,16 @@ Patches:
                  decimal freq, MODE suffix) from WSJTX 2.x jt9
               3. Jt9Decoder.parse(): guard the new-format except block so its
                  own ValueError doesn't chain-corrupt the log
-  queue.py  — QueueJob.run(): read decodes from decoded.txt instead of stdout;
-              truncate decoded.txt before each run so jt9's overwrite-not-append
-              behaviour is handled correctly (fixes zero PSKReporter spots)
+              4. WsprDecoder.parse(): use split() instead of fixed-byte slices
+                 to handle both old wsprd 1.x format (7 fields) and new
+                 wsprd 2.x format (8 fields with ntype prepended)
+
+  queue.py  — QueueJob.run():
+              - jt9-based decoders (FT8, FT4, JT65): read decodes from
+                decoded.txt (jt9 2.x writes there, not stdout); truncate
+                decoded.txt before each run to avoid concurrent-job pollution
+              - wsprd (WSPR): read from stdout (wsprd writes to stdout/wspr_spots.txt,
+                not decoded.txt); previous patch discarded wsprd output entirely
 """
 
 import os
@@ -162,6 +169,68 @@ def patch_wsjt():
     else:
         print("wsjt.py: null-byte skip already present")
 
+    # ── Part C: WsprDecoder.parse() — split()-based parser ────────────────────
+    content_now = '\n'.join(lines)
+
+    OLD_WSPR = (
+        'class WsprDecoder(Decoder):\n'
+        '    def parse(self, msg, dial_freq):\n'
+        '        # wspr sample\n'
+        "        # '2600 -24  0.4   0.001492 -1  G8AXA JO01 33'\n"
+        "        # '0052 -29  2.6   0.001486  0  G02CWT IO92 23'\n"
+        '        msg, timestamp = self.parse_timestamp(msg)\n'
+        '        wsjt_msg = msg[24:].strip()\n'
+        '        result = {\n'
+        '            "timestamp": timestamp,\n'
+        '            "db": float(msg[0:3]),\n'
+        '            "dt": float(msg[4:8]),\n'
+        '            "freq": dial_freq + int(float(msg[10:20]) * 1e6),\n'
+        '            "drift": int(msg[20:23]),\n'
+        '            "msg": wsjt_msg,\n'
+        '        }\n'
+        '        result.update(self.messageParser.parse(wsjt_msg))\n'
+        '        return result'
+    )
+
+    NEW_WSPR = (
+        'class WsprDecoder(Decoder):\n'
+        '    def parse(self, msg, dial_freq):\n'
+        '        msg, timestamp = self.parse_timestamp(msg)\n'
+        '        parts = msg.split()\n'
+        '        # wsprd stdout formats (after timestamp strip):\n'
+        '        # Old (7 fields):  snr  dt  freq_MHz  drift  call  loc  pwr\n'
+        '        # New (8+ fields): ntype  snr  dt  freq_MHz  drift  call  loc  pwr\n'
+        '        try:\n'
+        '            if len(parts) >= 8:\n'
+        '                snr_s, dt_s, freq_s, drift_s = parts[1], parts[2], parts[3], parts[4]\n'
+        '            elif len(parts) >= 7:\n'
+        '                snr_s, dt_s, freq_s, drift_s = parts[0], parts[1], parts[2], parts[3]\n'
+        '            else:\n'
+        '                raise ValueError("too few fields: {}".format(len(parts)))\n'
+        '            wsjt_msg = \' \'.join(parts[-3:])\n'
+        '            result = {\n'
+        '                "timestamp": timestamp,\n'
+        '                "db": float(snr_s),\n'
+        '                "dt": float(dt_s),\n'
+        '                "freq": dial_freq + int(float(freq_s) * 1e6),\n'
+        '                "drift": int(drift_s),\n'
+        '                "msg": wsjt_msg,\n'
+        '            }\n'
+        '        except (ValueError, IndexError):\n'
+        '            raise ValueError("WSPR parse failed: " + repr(msg[:60])) from None\n'
+        '        result.update(self.messageParser.parse(wsjt_msg))\n'
+        '        return result'
+    )
+
+    if NEW_WSPR in content_now:
+        print("wsjt.py: WsprDecoder.parse already patched")
+    elif OLD_WSPR in content_now:
+        lines = content_now.replace(OLD_WSPR, NEW_WSPR, 1).split('\n')
+        print("wsjt.py: WsprDecoder.parse patched (split-based, handles old+new format)")
+        changed = True
+    else:
+        print("wsjt.py: WsprDecoder.parse pattern not found — check manually")
+
     if changed:
         with open(WSJT_PATH, 'w') as f:
             f.write('\n'.join(lines))
@@ -193,9 +262,8 @@ OLD_QUEUE_RUN = '''\
         if lines is not None:
             self.writer.sendResult(QueueJobResult(self.profile, self.frequency, lines))'''
 
-# Patched version: reads from decoded.txt; truncates it first so jt9's
-# overwrite-not-append behaviour doesn't silently drop every decode.
-NEW_QUEUE_RUN = '''\
+# Intermediate state (first patch: decoded.txt only, no wsprd split)
+INTERMEDIATE_QUEUE_RUN = '''\
     def run(self):
         logger.debug("processing file %s", self.file)
         tmp_dir = CoreConfig().get_temporary_directory()
@@ -235,6 +303,59 @@ NEW_QUEUE_RUN = '''\
         if lines:
             self.writer.sendResult(QueueJobResult(self.profile, self.frequency, lines))'''
 
+# Final patched version: jt9 decoders use decoded.txt; wsprd uses stdout.
+# wsprd writes to wspr_spots.txt, not decoded.txt; and the queue has multiple
+# workers, so a long wsprd job (60 s) would otherwise read FT8 content written
+# to decoded.txt by a concurrent FT8 job.
+NEW_QUEUE_RUN = '''\
+    def run(self):
+        logger.debug("processing file %s", self.file)
+        tmp_dir = CoreConfig().get_temporary_directory()
+        cmd = self.profile.decoder_commandline(self.file)
+        is_wsprd = cmd[0] == 'wsprd'
+        decoded_file = os.path.join(tmp_dir, "decoded.txt")
+
+        if not is_wsprd:
+            # jt9 2.x overwrites (not appends) decoded.txt; truncate before run
+            # to avoid reading stale content from a concurrent job.
+            try:
+                open(decoded_file, 'wb').close()
+            except OSError:
+                pass
+
+        decoder = subprocess.Popen(
+            ["nice", "-n", "10"] + cmd,
+            stdout=subprocess.PIPE,
+            cwd=tmp_dir,
+            close_fds=True,
+            )
+
+        if is_wsprd:
+            # wsprd writes decodes to stdout (not decoded.txt); capture it directly.
+            lines = []
+            try:
+                lines = [l for l in decoder.stdout]
+            except OSError:
+                decoder.stdout.flush()
+                logger.debug("output has gone away while decoding job.")
+        else:
+            # jt9: drain stdout (only <DecodeFinished>); actual decodes are in decoded.txt.
+            try:
+                for _ in decoder.stdout:
+                    pass
+            except OSError:
+                decoder.stdout.flush()
+                logger.debug("output has gone away while decoding job.")
+            lines = []
+            try:
+                with open(decoded_file, "rb") as f:
+                    lines = f.readlines()
+            except OSError:
+                pass
+
+        if lines:
+            self.writer.sendResult(QueueJobResult(self.profile, self.frequency, lines))'''
+
 
 def patch_queue():
     with open(QUEUE_PATH) as f:
@@ -243,15 +364,22 @@ def patch_queue():
     if NEW_QUEUE_RUN in content:
         print("queue.py: already patched"); return False
 
-    if OLD_QUEUE_RUN not in content:
-        print("queue.py: unexpected content — cannot patch automatically; inspect manually")
-        sys.exit(1)
+    if OLD_QUEUE_RUN in content:
+        content = content.replace(OLD_QUEUE_RUN, NEW_QUEUE_RUN, 1)
+        with open(QUEUE_PATH, 'w') as f:
+            f.write(content)
+        print("queue.py: patched (from original)")
+        return True
 
-    content = content.replace(OLD_QUEUE_RUN, NEW_QUEUE_RUN, 1)
-    with open(QUEUE_PATH, 'w') as f:
-        f.write(content)
-    print("queue.py: patched")
-    return True
+    if INTERMEDIATE_QUEUE_RUN in content:
+        content = content.replace(INTERMEDIATE_QUEUE_RUN, NEW_QUEUE_RUN, 1)
+        with open(QUEUE_PATH, 'w') as f:
+            f.write(content)
+        print("queue.py: patched (from intermediate state — added wsprd stdout handling)")
+        return True
+
+    print("queue.py: unexpected content — cannot patch automatically; inspect manually")
+    sys.exit(1)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
